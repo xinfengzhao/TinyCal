@@ -1,4 +1,4 @@
-# TinyCal 假期拼假助手技术方案（草稿 v1.1）
+# TinyCal 假期拼假助手技术方案（草稿 v1.2）
 
 | 项 | 值 |
 |---|---|
@@ -15,6 +15,7 @@
 |---|---|---|
 | v1 | 2026-08-24 | 初版技术方案 |
 | v1.1 | 2026-08-24 | 按质量评审修正 G1 索引公式、MR 测试映射，并补充候选过滤、支配去重、unknown、业务 code、缓存兼容、任务代次和 UI 状态迁移验证 |
+| v1.2 | 2026-08-24 | 补充 timor.tech HTTP/HTTPS 联网证据、响应状态映射及发布阻塞结论 |
 
 ## 1. 目标与非目标
 
@@ -212,12 +213,33 @@ protocol DateProviding {
 - 旧格式年份缓存（直接编码 `Response`）必须可读；读取后以内存兼容，不要求立即写盘迁移。只有网络刷新成功时才原子写入带 `schemaVersion/fetchedAt` 的新格式。
 - 坏缓存与“次年未公布”必须区分：前者尝试回源并报告缓存损坏，后者是合法数据状态，不反复重试制造请求风暴。
 
+响应到状态的首期映射定义：
+
+| 响应 | 状态 | 缓存行为 |
+|---|---|---|
+| 传输失败、超时、TLS 失败或 HTTP 非 2xx（包括 403） | `unavailable` | 保留并降级使用旧缓存；不得解释为“未公布” |
+| HTTP 2xx 但非 JSON或字段无法解码 | `invalidResponse` | 保留旧缓存，不写盘 |
+| HTTP 2xx、可解码，但 `Response.code` 不是经 fixture 确认的成功码 | `invalidResponse` | 保留旧缓存，不写盘；除非供应商文档明确给出独立“未公布”业务码，否则不得猜测 |
+| 成功码、`holiday` 为空、请求年份晚于当前自然年 | `unpublished` | 不写空缓存，展示“该年度安排尚未公布” |
+| 成功码、`holiday` 为空、请求年份为当前或历史年份 | `invalidResponse` | 保留旧缓存并允许重试 |
+| payload 中可验证年份与请求年份不一致 | `invalidResponse` | 不写盘、不参与计算 |
+| 成功码、非空且日期均属于请求年份 | 可用数据 | 原子写入并替换内存 |
+
+由于现有 `Response` 没有顶层年份字段，“年份不匹配”通过逐条校验 `Holiday.date` 的年份实现；若接口日期字段实际不含年份，则必须在 Remote DTO 层补充可验证信息或取消该项校验，不能用字典键 `MM-dd` 推断年份。
+
 ## 7. HTTPS 与 ATS
 
 实施前进行只读联调确认 `https://timor.tech/api/holiday/year/{year}` 的证书、重定向、响应结构和可用性：
 
+### 7.1 2026-08-24 联网核对结果
+
+- `http://timor.tech/api/holiday/year/{year}` 对 2026、2027 均返回 HTTP 301，重定向到同路径 HTTPS。
+- HTTPS TLS 握手及 HTTP/2 可达，但对 2026、2027、2099 均返回 HTTP 403、`cf-mitigated: challenge` 和 HTML Challenge 页面，不是接口 JSON。
+- 因所有年份都在 Cloudflare 层被拦截，本次无法观察成功 `Response.code`、空 `holiday` 或次年未公布的真实业务响应；403 只能映射为 `unavailable`，不能映射为 `unpublished`。
+- 当前结果表明“支持 HTTPS”不等于“原生 macOS 客户端可稳定调用”。进入 MR-2 前必须以应用使用的 `URLSession` User-Agent 在目标网络环境复测，或取得供应商 API 客户端放行说明。
+
 - HTTPS 同域可用：生产 URL 改为 HTTPS，删除 `NSAllowsArbitraryLoads`；保留沙盒 `network.client` 权限。
-- HTTPS 不可用或稳定性不足：不得静默保留全局 ATS 放行作为首发方案，应由产品/安全确认替代数据源或有限域名例外；这将阻塞发布而非阻塞算法开发。
+- HTTPS 不可用、持续触发 Challenge 或稳定性不足：不得静默保留全局 ATS 放行作为首发方案；HTTP 当前也只会重定向到 HTTPS，有限 ATS 例外不能解决 Cloudflare 403。应更换可供客户端直接调用的数据源、增加受控服务端代理，或由供应商放行；这将阻塞发布而非阻塞算法开发。
 - 测试覆盖 TLS/网络失败、非 200、业务错误、坏 JSON、空数据和超时；不记录用户查询参数或年假信息。
 
 ## 8. UI 状态与调用链
