@@ -1,4 +1,4 @@
-# TinyCal 假期拼假助手技术方案（草稿 v1）
+# TinyCal 假期拼假助手技术方案（草稿 v1.1）
 
 | 项 | 值 |
 |---|---|
@@ -8,6 +8,13 @@
 | 测试方案 | `TEST_PLAN_HOLIDAY_BRIDGE.md`，HB-1～51 + TC-G1 |
 | 编写日期 | 2026-08-24 |
 | 实施约束 | 本文只设计方案，不修改生产代码 |
+
+## 修订记录
+
+| 版本 | 日期 | 说明 |
+|---|---|---|
+| v1 | 2026-08-24 | 初版技术方案 |
+| v1.1 | 2026-08-24 | 按质量评审修正 G1 索引公式、MR 测试映射，并补充候选过滤、支配去重、unknown、业务 code、缓存兼容、任务代次和 UI 状态迁移验证 |
 
 ## 1. 目标与非目标
 
@@ -38,10 +45,10 @@
 G1 修复采用列索引公式，避免继续维护分支：
 
 ```swift
-let trailingCount = (7 - endDate.mondayBasedWeekdayIndex) % 7
+let trailingCount = (6 - endDate.mondayBasedWeekdayIndex) % 7
 ```
 
-其中周一索引为 0、周日为 6；仅追加 `1...trailingCount`。修复必须由 TC-G1 覆盖月末周日，同时覆盖周一至周六月末，防止修复周日后破坏其他月份。
+其中明确使用 0 基索引 `Mon=0 ... Sun=6`，因此补齐到周日所需天数为 `(6 - index) % 7`：周一月末补 6 天，周六月末补 1 天，周日月末补 0 天。仅在 `trailingCount > 0` 时追加 `1...trailingCount`。TC-G1 必须参数化覆盖全部 7 种月末星期，而不只覆盖周日，以防修复幽灵周时破坏其余六种边界。
 
 ## 3. 产品决策与默认值
 
@@ -141,7 +148,8 @@ protocol HolidayBridgePlanning {
 3. 默认推荐候选需包含法定节假日，并按待确认默认值要求至少 1 个请假日。
 4. 指定目标节假日时，候选必须覆盖该节假日的至少一天。
 5. 指定期望连休天数时，`restDayCount >= minimumRestDays`。
-6. 对同一组 `leaveDates` 或同一 `[startDate,endDate]` 去重；剔除被另一方案严格支配的候选：请假不少且连休不更多。
+6. 纯周末候选不进入推荐；完全无需请假的法定长假只进入节假日信息区，不进入拼假 Top 5。对应的 0 请假场景仍由算法分类测试覆盖，但推荐结果必须过滤。
+7. 先按规范化的 `[startDate,endDate,leaveDates]` 去除完全重复项；再在同一查询及同一目标节假日分组内做支配去重。若方案 A 的请假天数不多于 B、连续休息天数不少于 B，且至少一项严格更优，则 A 支配 B，B 不进入推荐。不同目标节假日之间不互相支配，避免 Top 5 丢失节日多样性。
 
 区间数量约为 `366 × 367 / 2 ≈ 67k`，每个区间若增量维护工作日计数、假期标记和名称，时间复杂度 O(n²)、空间复杂度 O(k)，无需并行或复杂缓存。计算在后台 Task 执行，目标基准为 Release 构建单次小于 100ms；UI 只接收最终值。
 
@@ -197,6 +205,12 @@ protocol DateProviding {
 - 强刷失败且无旧值：年份状态为 `unavailable`；基础月历继续工作，拼假计算不可用或仅对完整年份的区间给出明确受限结果。
 - 接口 HTTP 200 但业务 `code` 非成功值、空 `holiday`、年份不匹配均不得覆盖有效缓存。空数据结合请求年份和接口语义映射为 `unpublished` 或 `invalidResponse`，映射规则需在联调后固化 fixture。
 - 文件写入采用临时文件后原子替换，避免进程中断产生截断缓存。
+
+补充验证口径：
+
+- `Response.code` 非成功时即使 HTTP 为 200，也必须返回业务错误；有旧缓存时继续使用旧值，无旧缓存时进入不可用态，且不得写文件或覆盖内存。
+- 旧格式年份缓存（直接编码 `Response`）必须可读；读取后以内存兼容，不要求立即写盘迁移。只有网络刷新成功时才原子写入带 `schemaVersion/fetchedAt` 的新格式。
+- 坏缓存与“次年未公布”必须区分：前者尝试回源并报告缓存损坏，后者是合法数据状态，不反复重试制造请求风暴。
 
 ## 7. HTTPS 与 ATS
 
@@ -262,6 +276,8 @@ enum HolidayBridgeViewState {
 - `Set<DateOnly>` 提供 O(1) 高亮查询，避免每个 cell 对方案数组线性扫描。
 - 12 个月约 366 天，算法性能目标 Release <100ms、无明显 Popover 卡顿；实际基准随 MR 提交。
 
+任务代次必须有确定性测试：先启动慢查询 A，再启动快查询 B；即使 A 最后完成，最终状态仍必须属于 B。关闭 Popover 或切换查询时取消旧 Task；无法及时取消的依赖结果也由 generation ID 丢弃。
+
 ## 10. 异常、兼容与回滚
 
 - macOS 最低版本保持工程现状 12.0，验证 Intel 与 Apple Silicon 架构构建。
@@ -307,19 +323,19 @@ enum HolidayBridgeViewState {
 - 建立 XCTest Target 和 fixture 基础设施。
 - 引入 DateOnly/可控时间源、修复 G1。
 - 实现纯函数 Planner、排序、去重和性能基准。
-- 验证：TC-G1、HB-1～15、HB-47、HB-50、HB-51；执行 Debug/Release 构建。
+- 验证：TC-G1（全部 7 种月末星期）、HB-1～15、HB-47、HB-50、HB-51；执行 Debug/Release 构建。HB-48/49 不属于 MR-1。
 
 ### MR-2：数据、缓存、刷新与安全
 
 - 引入 Remote/Cache 协议、Repository、缓存元数据和坏缓存回源。
 - 实现跨年加载、未公布状态、强刷保旧、请求去重。
 - 验证 HTTPS 后移除全局 ATS 放行。
-- 验证：HB-16～28、HB-35～39、HB-48～49；检查 `Info.plist` 不含全局 arbitrary loads。
+- 验证：HB-16～28、HB-35～39、HB-48、HB-49；补充业务 `Response.code`、旧缓存兼容、unknown 跨界和坏缓存区分用例；检查 `Info.plist` 不含全局 arbitrary loads。
 
 ### MR-3：UI 联动与回归
 
 - 实现助手状态机、列表/详情/空异常态和月历高亮。
-- 验证：HB-29～34、HB-40～46；手工覆盖深浅色、Popover 收起、跨月翻页、离线和刷新失败。
+- 验证：HB-29～34、HB-40～46；补充 ViewModel generation ID 和 `idle → loading → list/detail/empty/stale/unavailable/unpublished` 合法迁移测试；手工覆盖深浅色、Popover 收起、跨月翻页、离线和刷新失败。
 
 每个 MR 必须附：基线/目标 commit、变更范围、实际执行命令、测试通过数、失败或豁免、截图/录屏（UI MR）、风险和回滚方式。未执行的验证不得标记通过。
 
@@ -328,8 +344,12 @@ enum HolidayBridgeViewState {
 - 产品必须确认跨年、次年不估算、候选资格和 HTTPS处理方式。
 - TC-G1 必须通过，不允许幽灵周进入首发。
 - HB-1～15 与可测性 HB-47～51 全通过。
+- 候选过滤测试必须证明纯周末及零请假法定长假不进入 Top 5，同时节假日信息仍可展示。
+- 支配去重必须覆盖完全重复、同节日被支配和不同节日不互相支配三类场景。
 - 网络/缓存失败不得清空有效旧方案，坏缓存不得永久阻塞回源。
-- 缺失年份不得生成看似确定的跨年方案。
+- `unknown` 日期不得被跨越；缺失年份不得生成看似确定的跨年方案。
+- HTTP 200 但 `Response.code` 非成功不得覆盖缓存；旧格式缓存必须保持可读。
+- 过期 ViewModel Task 不得覆盖新查询状态；UI 状态迁移必须可重复测试。
 - 无新增 EventKit/通知权限；无用户查询数据上传。
 - Debug/Release 在 macOS 12+ 目标成功构建，相关单测全部通过。
 - UI 不破坏月历导航、农历/节假日标记、设置和菜单栏刷新。
