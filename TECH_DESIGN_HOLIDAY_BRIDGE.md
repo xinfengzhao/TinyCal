@@ -1,4 +1,4 @@
-# TinyCal 假期拼假助手技术方案（草稿 v1.2）
+# TinyCal 假期拼假助手技术方案（草稿 v1.3）
 
 | 项 | 值 |
 |---|---|
@@ -16,6 +16,7 @@
 | v1 | 2026-08-24 | 初版技术方案 |
 | v1.1 | 2026-08-24 | 按质量评审修正 G1 索引公式、MR 测试映射，并补充候选过滤、支配去重、unknown、业务 code、缓存兼容、任务代次和 UI 状态迁移验证 |
 | v1.2 | 2026-08-24 | 补充 timor.tech HTTP/HTTPS 联网证据、响应状态映射及发布阻塞结论 |
+| v1.3 | 2026-08-24 | 使用 Foundation URLSession 复测生产同栈，解除数据源 P0 推断并固化空数据/不可用状态边界 |
 
 ## 1. 目标与非目标
 
@@ -204,7 +205,7 @@ protocol DateProviding {
 - 强制刷新：绕过内存和文件读取，直接请求网络；成功后原子覆盖文件和内存，再触发重新计算。
 - 强刷失败且有旧值：保留旧值和现有方案，状态变为 `stale`，显示非阻塞警告。
 - 强刷失败且无旧值：年份状态为 `unavailable`；基础月历继续工作，拼假计算不可用或仅对完整年份的区间给出明确受限结果。
-- 接口 HTTP 200 但业务 `code` 非成功值、空 `holiday`、年份不匹配均不得覆盖有效缓存。空数据结合请求年份和接口语义映射为 `unpublished` 或 `invalidResponse`，映射规则需在联调后固化 fixture。
+- 接口 HTTP 200 但业务 `code` 非成功值、空 `holiday`、年份不匹配均不得覆盖有效缓存。已实测 `code=0 + holiday={}` 是未来年份未公布形态，映射为 `unpublished`。
 - 文件写入采用临时文件后原子替换，避免进程中断产生截断缓存。
 
 补充验证口径：
@@ -220,8 +221,7 @@ protocol DateProviding {
 | 传输失败、超时、TLS 失败或 HTTP 非 2xx（包括 403） | `unavailable` | 保留并降级使用旧缓存；不得解释为“未公布” |
 | HTTP 2xx 但非 JSON或字段无法解码 | `invalidResponse` | 保留旧缓存，不写盘 |
 | HTTP 2xx、可解码，但 `Response.code` 不是经 fixture 确认的成功码 | `invalidResponse` | 保留旧缓存，不写盘；除非供应商文档明确给出独立“未公布”业务码，否则不得猜测 |
-| 成功码、`holiday` 为空、请求年份晚于当前自然年 | `unpublished` | 不写空缓存，展示“该年度安排尚未公布” |
-| 成功码、`holiday` 为空、请求年份为当前或历史年份 | `invalidResponse` | 保留旧缓存并允许重试 |
+| 成功码且 `holiday` 为空 | `unpublished` | 不写空缓存，展示“该年度安排尚未公布”；2027、2099 已取得真实样本 |
 | payload 中可验证年份与请求年份不一致 | `invalidResponse` | 不写盘、不参与计算 |
 | 成功码、非空且日期均属于请求年份 | 可用数据 | 原子写入并替换内存 |
 
@@ -233,14 +233,26 @@ protocol DateProviding {
 
 ### 7.1 2026-08-24 联网核对结果
 
-- `http://timor.tech/api/holiday/year/{year}` 对 2026、2027 均返回 HTTP 301，重定向到同路径 HTTPS。
-- HTTPS TLS 握手及 HTTP/2 可达，但对 2026、2027、2099 均返回 HTTP 403、`cf-mitigated: challenge` 和 HTML Challenge 页面，不是接口 JSON。
-- 因所有年份都在 Cloudflare 层被拦截，本次无法观察成功 `Response.code`、空 `holiday` 或次年未公布的真实业务响应；403 只能映射为 `unavailable`，不能映射为 `unpublished`。
-- 当前结果表明“支持 HTTPS”不等于“原生 macOS 客户端可稳定调用”。进入 MR-2 前必须以应用使用的 `URLSession` User-Agent 在目标网络环境复测，或取得供应商 API 客户端放行说明。
+复测环境：macOS 26.4.1（Build 25E253）、arm64、Swift 6.3.3、Asia/Shanghai。使用 Foundation `URLSession.shared.dataTask`，与当前 `Webservice.getStocks` 相同网络栈；探针 User-Agent 为 `swift-frontend (unknown version) CFNetwork/3860.500.112 Darwin/25.4.0`。
+
+- `http://timor.tech/api/holiday/year/{year}` 会返回 HTTP 301，Foundation URLSession 自动跟随至同路径 HTTPS。
+- 2026 最终返回 HTTP 200、`application/json; charset=utf-8`、`code=0` 且 `holiday` 非空。
+- 2027、2099 最终返回 HTTP 200、JSON、`code=0` 且 `holiday={}`；据此将成功空数据固化为 `unpublished` fixture。
+- curl 默认 User-Agent 对相同 HTTPS URL 返回 HTTP 403、`cf-mitigated: challenge` 和 HTML。该结果说明 CDN 行为与客户端特征有关，不代表生产所用 Foundation 网络栈不可用。
+- HTTP 403、HTML Challenge 或其他非 2xx 仍统一映射为 `unavailable`，不得误判为 `unpublished`。
+- 此次复测解除“macOS URLSession 无法取得 JSON / 数据源 P0”的判断。发布前仍必须以签名发布构建的 TinyCal 可执行文件在目标网络完成冷缓存冒烟，因为正式 App User-Agent 与命令行探针不完全相同。
 
 - HTTPS 同域可用：生产 URL 改为 HTTPS，删除 `NSAllowsArbitraryLoads`；保留沙盒 `network.client` 权限。
-- HTTPS 不可用、持续触发 Challenge 或稳定性不足：不得静默保留全局 ATS 放行作为首发方案；HTTP 当前也只会重定向到 HTTPS，有限 ATS 例外不能解决 Cloudflare 403。应更换可供客户端直接调用的数据源、增加受控服务端代理，或由供应商放行；这将阻塞发布而非阻塞算法开发。
+- 若发布构建仍触发 Challenge 或 HTTPS 稳定性不足，不得静默保留全局 ATS 放行；HTTP 当前会重定向到 HTTPS，ATS 例外不能解决 Cloudflare 403。此时应更换可供客户端直接调用的数据源、增加受控服务端代理或由供应商放行，并阻塞发布。
 - 测试覆盖 TLS/网络失败、非 200、业务错误、坏 JSON、空数据和超时；不记录用户查询参数或年假信息。
+
+### 7.2 保留风险
+
+- 当前生产代码仍从 HTTP URL 起请求并依赖重定向；MR-2 应直接切换 HTTPS，并在发布冒烟通过后移除全局 `NSAllowsArbitraryLoads`。
+- 合法文件缓存无 TTL 或新鲜度提示，会无限期遮蔽服务器更新。
+- 坏缓存解码失败后直接进入外层 `catch`，不会继续网络回源。
+- 成功空数据不会写缓存，也没有 `unpublished` UI 状态，用户无法区分未公布与加载失败。
+- 网络、HTTP 和解码失败只打印日志，UI静默；MR-2 必须保留旧数据并暴露 `stale/unavailable/invalidResponse` 状态。
 
 ## 8. UI 状态与调用链
 
@@ -383,7 +395,7 @@ enum HolidayBridgeViewState {
 1. 默认推荐是否明确排除“0 天请假普通周末”，以及是否要求候选至少包含一个法定节假日和一个建议请假日。
 2. 首期是否正式支持未来 12 个月内跨自然年方案。
 3. 次年未公布是否确认“不估算、不生成跨未知日期的确定性方案”。
-4. HTTPS 同域不可用时，是更换数据源还是允许经过安全评审的有限域名例外。
+4. 发布构建真实应用冒烟若触发 Cloudflare Challenge，是更换数据源、增加代理还是推动供应商放行。
 
 ### 建议默认值，可先开发公共结构
 
@@ -395,4 +407,4 @@ enum HolidayBridgeViewState {
 
 ## 15. 结论
 
-方案采用“可注入数据仓库 + 纯函数 Planner + MainActor UI 状态机”三层结构，以 MR-1/2/3 分离日期/算法、数据安全和 UI 风险。当前可以先实现不依赖产品口径的基础设施；推荐候选资格、跨年降级及 HTTPS 不可用时的安全策略确认前，不应完成或发布首期功能。
+方案采用“可注入数据仓库 + 纯函数 Planner + MainActor UI 状态机”三层结构，以 MR-1/2/3 分离日期/算法、数据安全和 UI 风险。Foundation URLSession 数据源 P0 已解除，MR-1/MR-2 可按产品口径推进；发布仍须通过真实 TinyCal 构建的冷缓存网络冒烟。推荐候选资格与跨年降级未确认前，不应完成或发布首期功能。
